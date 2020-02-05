@@ -1,0 +1,246 @@
+---
+title: "A Complete Case Study: the Lung Cancer dataset"
+---
+
+# Data preparation
+
+```{r}
+library(tidyverse)
+library(survival)
+
+?lung
+```
+
+```{r}
+table(lung$inst)
+```
+
+```{r}
+nrow(lung)
+```
+
+```{r}
+d_raw <- as.tibble(lung)
+summary(d_raw)
+```
+
+```{r}
+d <- mutate(d_raw,
+  event = 0 + (status == 2),
+  inst = factor(inst),
+  sex = factor(sex, levels = 1:2, labels = c("male", "female"))
+)
+d
+```
+
+```{r}
+summary(d)
+```
+
+
+Impute some missing values
+```{r}
+fit.meal <- lm(meal.cal ~ sex, data = d)
+summary(fit.meal)
+```
+
+```{r}
+d$meal.cal[is.na(d$meal.cal)] <-
+  predict(fit.meal, newdata = subset(d, is.na(meal.cal)))
+summary(d)
+```
+
+
+```{r}
+d$wt.loss[is.na(d$wt.loss)] <-
+  predict(lm(wt.loss ~ age + sex, data = d), newdata = subset(d, is.na(wt.loss)))
+summary(d)
+```
+
+
+One sample has no 'institute'??
+```{r}
+subset(d, is.na(inst))
+```
+
+```{r}
+d$y <- with(d, Surv(time / 30.5, event))
+d
+head(d$y)
+```
+
+# Exploratory analysis
+
+```{r}
+survfit(y ~ 1, data = d)
+survfit(y ~ sex, data = d)
+```
+
+```{r}
+str(d)
+table(d$ph.ecog)
+survfit(y ~ ph.ecog, data = d)
+```
+
+```{r}
+hist(d$age)
+```
+
+```{r}
+d$ageCat <- cut(d$age, breaks = c(0, 50, 70, Inf))
+table(d$ageCat)
+survfit(y ~ ageCat, data = d)
+```
+
+```{r}
+table(d$ph.karno)
+table(d$pat.karno)
+survfit(y ~ ph.karno, data = d)
+survfit(y ~ pat.karno, data = d)
+```
+
+```{r}
+hist(d$meal.cal)
+```
+
+```{r}
+survfit(y ~ I(meal.cal < 800), data = d)
+```
+
+```{r}
+stem(d$wt.loss)
+survfit(y ~ I(wt.loss > 0), data = d)
+stem(d$ph.karno)
+stem(d$meal.cal)
+survfit(y ~ I(meal.cal < 800), data = d)
+stem(d$wt.loss)
+```
+
+# Comparing 2 groups
+```{r}
+survdiff(y ~ I(wt.loss > 0), data = d)
+survdiff(y ~ ageCat, data = d)
+survdiff(y ~ sex, data = d)
+survdiff(y ~ I(wt.loss > 0), data = d)
+survdiff(y ~ I(meal.cal < 800), data = d)
+survdiff(y ~ ph.ecog, data = d)
+survdiff(y ~ ph.karno, data = d)
+```
+
+Lets organize our logrank test results in a more compact manner:
+```{r}
+test_variable <- function(var_name) {
+  e$x <- e[[ var_name ]]
+  survdiff(y ~ x, data = e)
+}
+e <- mutate(d,
+  weight_loss = wt.loss > 0,
+  meal_calories_low = meal.cal < 800,
+  age = ageCat
+)
+
+logrank_tests <-
+  tibble(variable = c("weight_loss", "age", "sex", "meal_calories_low", "ph.ecog", "ph.karno")) %>%
+  mutate(obj = map(variable, test_variable),
+         tab = map(obj, broom::glance)) %>%
+  unnest(tab)
+logrank_tests
+```
+
+
+# Data Modeling and Machine Learning
+
+## Models training
+```{r}
+load("data/lung.RData")
+d1 <- lung
+fit <- coxph(y ~ ., data = d1)
+summary(fit)
+```
+
+### model 1. AIC-STEP
+```{r}
+fit.aic <- step(fit)
+summary(fit.aic)
+b.aic <- coef(fit.aic)
+```
+
+### model 2. manual
+```{r}
+fit.manual <- coxph(y ~ sex + ph.ecog + pat.karno + wt.loss, data = d1)
+b.manual <- coef(fit.manual)
+```
+
+### model 3. elastic net
+```{r}
+library(glmnet)
+X <- model.matrix(y ~ ., data = d1)[, -1]
+str(X)
+head(X)
+y <- d1$y
+fit <- cv.glmnet(X, y, family = "cox")
+b.enet.all <- coef(fit, s = "lambda.min")
+b.enet <- b.enet.all[b.enet.all != 0]
+names(b.enet) <- colnames(X)[as.logical(b.enet.all != 0)]
+```
+
+### model 4. CCP
+```{r}
+fits <- plyr::adply(X, 2, function(x) broom::tidy(coxph(y ~ x)))
+print(fits)
+str(fits)
+b.CCP <- with(fits, structure(estimate, names = as.character(X1)))
+```
+
+```{r}
+models_coefficients <- tibble(
+  method = c("manual", "aic", "enet", "ccp"),
+  coefficients = list(b.manual, b.aic, b.enet, b.CCP)
+)
+models_coefficients
+```
+
+## Models testing
+```{r}
+lincom <- function(b, X) rowSums(sweep(X[, names(b), drop = FALSE], 2, b, FUN = "*"))
+```
+
+```{r}
+load("data/lung_newdata.RData")
+X.new <- model.matrix(y ~ . - 1, lung_newdata)
+y <- lung_newdata$y
+```
+
+```{r}
+models_performance <- mutate(models_coefficients,
+  predictions = map(coefficients, ~ lincom(., X.new)),
+  cox_obj = map(predictions, ~ coxph(y ~ I(. / sd(.)))),
+  cox_tab = map(cox_obj, broom::tidy)
+) %>%
+  unnest(cox_tab)
+models_performance
+```
+
+```{r}
+models_performance <- mutate(models_performance,
+  AUC = map_dbl(predictions, ~ survivalROC::survivalROC(y[, 1], y[, 2], ., predict.time = 12, method = "KM")$AUC)
+) %>%
+  select(method, estimate, std.error, p.value, AUC)
+models_performance
+```
+
+## Sharing the results outside of R
+```{r}
+models_coefficients_flat <- mutate(models_coefficients,
+  coefficients_tab = map(coefficients, ~ tibble(feature = names(.), coefficient = unname(.)))
+) %>%
+  unnest(coefficients_tab, .drop = TRUE) %>%
+  select(method, feature, coefficient)
+models_coefficients_flat
+```
+
+Write tables on disk:
+```{r}
+write_csv(models_coefficients_flat, "models_coefficients.csv")
+write_csv(models_performance, "models_performance.csv")
+```
