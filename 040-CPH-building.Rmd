@@ -1,0 +1,274 @@
+---
+title: "Cox Model Building and Diagnostics"
+---
+
+# Model building
+## Load the data
+
+```{r}
+library(tidyverse)
+library(survival)
+library(asaur)
+
+dat <- pharmacoSmoking
+```
+
+## The 4 candidate models
+```{r}
+M0 <- coxph(Surv(ttr, relapse) ~ 1, data = dat)
+MA <- coxph(Surv(ttr, relapse) ~ ageGroup4, data = dat)
+MB <- coxph(Surv(ttr, relapse) ~ employment, data = dat)
+MC <- coxph(Surv(ttr, relapse) ~ ageGroup4 + employment, data = dat)
+```
+
+## Comparing nested models: LRT
+```{r}
+anova(MA, MC)
+```
+
+## Comparing non-nested models: AIC
+```{r}
+fits <- list(MA = MA, MB = MB, MC = MC)
+sapply(fits, AIC)
+```
+
+## Automatic model selection based on AIC
+
+```{r}
+Mfull <- coxph(Surv(ttr, relapse) ~ grp + gender + race +
+                 employment + yearsSmoking + levelSmoking +
+                 ageGroup4 + priorAttempts + longestNoSmoke,
+               data = dat)
+```
+
+```{r}
+MAIC <- step(Mfull)
+```
+
+## Predictive power: concordance index
+
+```{r}
+summary(MA)
+```
+
+```{r}
+summary(MAIC)
+```
+
+## Predictive power: AUC
+
+```{r}
+library(survivalROC)
+data(mayo)
+```
+
+```{r}
+plot(survfit(Surv(time / 365.25, censor) ~ 1, data = mayo))
+```
+
+```{r}
+ROC.4 <- survivalROC(Stime = mayo$time,
+                     status = mayo$censor,
+                     marker = mayo$mayoscore4,
+                     predict.time = 365.25 * 5,
+                     method="KM")
+ROC.5 <- survivalROC(Stime = mayo$time,
+                     status = mayo$censor,
+                     marker = mayo$mayoscore5,
+                     predict.time = 365.25,
+                     method = "KM")
+```
+
+```{r}
+ROC <- list(mayo4 = ROC.4, mayo5 = ROC.5)
+map_dbl(ROC, "AUC")
+```
+
+```{r}
+dfl <- map(ROC, ~ with(., tibble(cutoff = cut.values, FP, TP)))
+for(nm in names(dfl)) {
+  dfl[[ nm ]]$marker <- nm
+}
+dat <- do.call(rbind, dfl)
+```
+
+```{r}
+dat
+```
+
+
+```{r}
+ggplot(dat, aes(FP, TP, color = marker)) +
+  geom_line() +
+  theme_bw(base_size = 9)
+```
+
+```{r}
+cutoff <- min(filter(dat, marker == "mayo5", FP <= 0.1)$cutoff)
+```
+
+```{r}
+mayo$prediction <-
+  ifelse(mayo$mayoscore5 <= cutoff,
+         "low_risk", "high_risk")
+```
+
+```{r}
+plot(survfit(Surv(time/365, censor) ~ prediction, data = mayo),
+     col = c("red", "blue"))
+```
+
+# Model diagnostics
+## Martingale residuals
+
+```{r}
+library(survival)
+library(asaur) ## dataset
+
+data(pharmacoSmoking)
+dat <- pharmacoSmoking
+```
+
+```{r}
+fit <- coxph(Surv(ttr, relapse) ~ grp + age + employment, data = dat)
+dat$residual <- residuals(fit, type = "martingale")
+```
+
+```{r}
+par(mfrow = c(1, 3), mar = c(4.2, 2, 2, 2))
+with(dat, {
+
+  plot(age, residual)
+  lines(lowess(age, residual), lwd = 2)
+
+  plot(residual ~ grp)
+
+  plot(residual ~ employment)
+
+})
+```
+
+```{r}
+dfbetas <- residuals(fit, type = 'dfbetas')
+dat$dfbetas <- sqrt(rowSums(dfbetas^2))
+```
+
+```{r}
+plot(dat$dfbetas, type = 'h')
+abline(h = 0)
+```
+
+## Proportionality of hazards
+
+Pancreatic cancer dataset
+```{r}
+library(survival)
+library(asaur) ## dataset
+library(plyr)
+library(ggplot2)
+
+fmt <- "%m/%d/%Y"
+dat <- as.tibble(pancreatic) %>%
+  mutate(
+  onstudy = as.Date(as.character(onstudy), format = fmt),
+  progression = as.Date(as.character(progression), format = fmt),
+  death = as.Date(as.character(death), format = fmt),
+  OS = death - onstudy,
+  PFS = ifelse(is.na(progression), OS, pmin(progression - onstudy, OS))) %>%
+  mutate(
+  PFS = Surv(as.numeric(PFS / 30.5)),
+  OS = Surv(as.numeric(OS / 30.5))
+  )
+dat
+```
+
+```{r}
+fit <- coxph(PFS ~ stage, data = dat)
+summary(fit)
+```
+
+
+```{r}
+fit.KM <- survfit(PFS ~ stage, data = dat)
+plot(fit.KM, fun= "cloglog", col = 1:2)
+```
+
+
+```{r}
+fit.KM <- survfit(Surv(ttr, relapse) ~ grp, data = pharmacoSmoking)
+
+plot(fit.KM, fun = "cloglog", col = 1:2)
+```
+
+### Schoenfeld residuals
+```{r}
+fit <- coxph(PFS ~ stage, data = dat)
+residual.sch <- cox.zph(fit)
+residual.sch
+```
+
+
+```{r}
+plot(residual.sch)
+```
+
+# Dealing with assumptions violations
+
+## Stratification
+
+```{r}
+library(asaur)
+d <- pharmacoSmoking
+d$employment <- ifelse(d$employment == "ft", "ft", "other")
+
+table(d$employment)
+```
+
+Stratified Cox model:
+```{r}
+fit <- coxph(Surv(ttr, relapse) ~ grp + strata(employment), data = d)
+
+summary(fit)
+```
+
+Note how there is no estimate associated with 'employment'.
+
+## Truncation
+
+```{r}
+library(asaur)
+library(survival)
+d <- pancreatic2
+
+plot(survfit(Surv(pfs, status) ~ stage, data = d), col = 1:2)
+```
+
+THIS IS *NOT* HOW IT IS DONE:
+```{r}
+d_WRONG <- subset(d, pfs <= 180)
+
+plot(survfit(Surv(pfs, status) ~ stage, data = d_WRONG), col = 1:2)
+```
+
+Here is how you do it:
+```{r}
+d_RIGHT <- within(d, {
+  status_truncated <- ifelse(pfs > 180, 0, status)
+  pfs_truncated <- ifelse(pfs > 180, 180, pfs)
+})
+```
+
+```{r}
+plot(survfit(Surv(pfs, status) ~ stage, data = d_RIGHT),
+     col = 1:2)
+```
+
+```{r}
+plot(survfit(Surv(pfs, status) ~ stage, data = d_RIGHT),
+     fun = "cloglog",
+     col = 1:2)
+```
+
+```{r}
+summary(coxph(Surv(pfs, status) ~ stage, data = d_RIGHT))
+```
