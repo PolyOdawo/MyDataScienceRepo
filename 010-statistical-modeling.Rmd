@@ -1,0 +1,382 @@
+---
+title: "Case Study: duration of hospitalization"
+---
+
+# Data preparation
+
+    Variable   Description
+    ---------- -----------------------------------
+    DUR        Duration of hospitalization (days)
+    AGE        Age (years)
+    SEX        1 = male 2 = female
+    TEMP       Body temperature (degrees Fahrenheit)
+    WBC        White blood cells per 100 ml blood
+    ANTIB      Antibiotic use: 1 = yes 2 = no
+    CULT       Blood culture taken 1 = yes 2 = no
+    SERV       Service: 1 = medical 2 = surgical
+    ---------- -----------------------------------
+
+```{r}
+library(tidyverse)
+raw <-
+  read_tsv("data/hospitalization.csv",
+           col_types = cols(id = 'c',
+                            dur = 'd',
+                            age = 'd',
+                            sex = 'c',
+                            temp = 'd',
+                            wbc = 'd',
+                            antib = 'c',
+                            cult = 'c',
+                            serv = 'c'))
+
+h <- mutate(raw,
+  sex = factor(sex, levels = c('1', '2'), labels = c('m', 'f')),
+  antib = factor(antib, levels = c('2', '1'), labels = c('no', 'yes')),
+  cult = factor(cult, levels = c('2', '1'), labels = c('no', 'yes')),
+  serv = factor(serv, levels = c('1', '2'), labels = c('medical', 'surgical')),
+  temp = (temp - 32.0) * 5/9  ## convert to Celsius
+  ) %>%
+  select(-id)
+```
+
+# Exploratory analysis
+
+```{r}
+summary(h)
+```
+
+```{r}
+hist(h$dur)
+```
+
+```{r}
+Fn <- ecdf(h$dur)
+summary(Fn)
+```
+
+```{r}
+plot(Fn)
+```
+
+```{r}
+hist(h$temp)
+```
+
+# Q1. How many patients go through overnight hospitalization?
+
+```{r}
+table(h$dur == 0)
+```
+
+```{r}
+prop.table(table(h$dur == 0))
+```
+
+Overall, 12% of the patients go through overnight hospitalization.
+
+We can get a confidence interval using the Binomial test:
+```{r}
+with(h, binom.test(table(dur == 0)))
+```
+
+# Q2. Is the body temperature at admission predictive of the duration of the hospitalization?
+
+```{r}
+plot(dur ~ temp, data = h)
+```
+
+Meh!
+
+```{r}
+ggplot(h, aes(x = temp > 37, y = dur)) +
+  geom_boxplot()
+```
+
+```{r}
+with(h, table(temp > 37, dur > 0))
+```
+
+```{r}
+with(h, prop.table(table(temp > 37, dur > 0), 1))
+```
+
+# Q3. What about blood works?
+
+```{r}
+ggplot(h, aes(x = cult, y = dur)) +
+  geom_boxplot()
+```
+
+```{r}
+with(h, table(cult, dur > 0))
+```
+
+```{r}
+with(h, prop.table(table(cult, dur > 0), 1))
+```
+
+# Q4. Statistical Modeling
+
+## Data preparation
+```{r}
+h$y <- h$dur > 0
+mean_temperature <- mean(h$temp)
+h$x <- h$temp - mean_temperature
+```
+
+## The Likelihood function
+```{r}
+logLik <- function(theta) {
+  alpha <- theta[1]
+  beta <- theta[2]
+  linear_predictor <- alpha + beta * h$x
+  probabilities <- plogis(linear_predictor)
+  log_terms <- dbinom(h$y,
+                      size = 1,
+                      prob = probabilities,
+                      log = TRUE)
+  sum(log_terms)
+}
+```
+
+```{r}
+debugonce(logLik)
+logLik(c(3, 3))
+```
+
+
+## Numerical maximization
+```{r}
+library(maxLik)
+
+fit <- maxLik(logLik, start = c(alpha = 0, beta = 0))
+summary(fit)
+```
+
+## Logistic regression
+
+```{r}
+fit2 <- glm(y ~ x, data = h, family = 'binomial')
+summary(fit2)
+```
+
+## Model-based predictions
+
+In the probability scale:
+```{r}
+predict(fit2,
+        newdata = data.frame(x = 38 - mean_temperature),
+        type = "response")
+```
+
+This is the so-called 'linear predictor':
+```{r}
+predict(fit2,
+        newdata = data.frame(x = 38 - mean_temperature),
+        type = "link")
+```
+
+# Exercises with simulated data
+
+## Data generation
+```{r}
+set.seed(1234)
+rate <- 0.2
+y <- rexp(100, rate = rate)
+```
+
+## Mean and median
+```{r}
+mean(y)
+1/rate
+```
+
+```{r}
+median(y)
+log(2)/rate
+```
+
+## ECDF
+```{r}
+F <- ecdf(y)
+plot(F)
+curve(pexp(x, rate = rate), col = "red", add = TRUE)
+```
+
+## Survival function
+```{r}
+S <- function(t) 1 - F(t)
+curve(S(x), from = 0, to = 30)
+curve(pexp(x, rate = rate, lower.tail = FALSE), col = "red", add = TRUE)
+```
+
+## Density and hazard functions
+
+```{r}
+f <- density(y, from = 0)
+curve(dexp(x, rate = rate), col = "red", from = 0, to = 25)
+lines(f)
+```
+
+```{r}
+h_empirical <- f$y / S(f$x)
+plot(f$x, h_empirical, type = "l")
+abline(h = rate, col = "red")
+```
+
+## Minus-log survival function
+
+```{r}
+clog_empirical <- -log(S(f$x))
+plot(f$x, clog_empirical, type = "l")
+abline(a = 0, b = rate, col = "red")
+```
+
+
+## Maximum Likelihood Estimation
+
+### The log-likelihood function
+```{r}
+logLik <- function(logRate) {
+  sum(dexp(y, rate = exp(logRate), log = TRUE))
+}
+```
+
+```{r}
+f <- Vectorize(logLik)
+curve(f(x), from = -3, to = 0)
+```
+
+### Numerical Maximization
+```{r}
+library(maxLik)
+fit <- maxLik(f, start = c(logRate = 0))
+summary(fit)
+```
+⌈⌈
+```{r}
+rate_MLE_numerical <- unname(exp(fit$estimate))
+rate_MLE_numerical
+```
+
+## Comparing different estimators
+
+### Mean and median
+
+```{r}
+c(theoretical = 1/rate,
+  empirical = mean(y),
+  MLE_numerical = 1/rate_MLE_numerical)
+```
+
+```{r}
+c(theoretical = log(2) / rate,
+  empirical = median(y),
+  MLE_numerical = log(2) / rate_MLE_numerical)
+```
+
+### Survival function
+
+```{r}
+Fn <- ecdf(y)
+S_empirical <- function(t) 1.0 - Fn(t)
+S_MLE_numerical <- function(t) pexp(t, rate = rate_MLE_numerical, lower.tail = FALSE)
+S_theoretical <- function(t) pexp(t, rate = rate, lower.tail = FALSE)
+
+curve(S_empirical, from = 0, to = 40)
+curve(S_MLE_numerical, col = "blue", add = TRUE)
+curve(S_theoretical, col = "red", add = TRUE)
+```
+
+### Hazard function
+
+```{r}
+h_theoretical <- Vectorize(function(t) rate)
+h_MLE_numerical <- Vectorize(function(t) rate_MLE_numerical)
+
+curve(h_theoretical, from = 0, to = 40, col = "red",
+      xlab = "time", ylab = "hazard")
+curve(h_MLE_numerical, col = "blue", add = TRUE)
+```
+
+# Fit the exponential distribution to the hospital duration data
+
+## MLE
+```{r}
+logLik <- function(logRate) {
+  sum(dexp(h$dur, rate = exp(logRate), log = TRUE))
+}
+fit <- maxLik(logLik, start = 0)
+summary(fit)
+```
+
+## A model linking body temperature to risk
+
+### Loglikelihood function
+
+```{r}
+logLik <- function(theta) {
+  alpha <- theta[1]
+  beta <- theta[2]
+  terms <- dexp(h$dur,
+                rate = exp(alpha + beta * (h$temp - 36)),
+                log = TRUE)
+  sum(terms)
+}
+```
+
+### MLE
+```{r}
+fit <- maxLik(logLik, start = c(alpha = 0, beta = 0))
+summary(fit)
+```
+
+### Q. What's the probability of staying 5 days or more?
+
+```{r}
+curve(pexp(5.0,
+           rate = exp(fit$estimate[1] + fit$estimate[2] * (x - 36)),
+           lower.tail = FALSE),
+      from = 36, to = 38,
+      xlab = "body temperature (C)",
+      ylab = "P(T > 5 | temperature)")
+```
+
+### How good is the exponential distribution for our data?
+
+We can only proceed with some approximate, qualitative assessments.
+
+Lets split the body temperature variable into just 2 levels: 'low' (temp<=37) and 'high' (temp>37), and compare empirical and theoretical complementary-log-log survival functions.
+
+```{r}
+h_low <- subset(h, 36 <= temp & temp <= 37)
+h_high <- subset(h, 37 < temp & temp <= 38)
+```
+
+```{r}
+clog <- function(y) {
+  function(t) {
+    S <- 1.0 - ecdf(y)(t)
+    -log(S)
+  }
+}
+```
+
+```{r}
+curve(clog(h_low$dur)(x),
+      from = 0, to = 30, col = "blue",
+      xlab = "time (days)",
+      ylab = "-log(S(t))")
+abline(a = 0, b = exp(fit$estimate[1] + fit$estimate[2] * 36.5),
+       col = 'blue', lty = 2)
+
+curve(clog(h_high$dur)(x),
+      from = 0, to = 30, col = "red", add = TRUE)
+abline(a = 0, b = exp(fit$estimate[1] + fit$estimate[2] * 37.5),
+       col = 'red', lty = 2)
+```
+
+The model fits the data rather poorly.
+
+Trying more flexible models (e.g., Weibull) is left as an exercise for the reader.
